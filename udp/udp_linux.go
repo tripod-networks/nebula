@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -22,9 +23,11 @@ import (
 type StdConn struct {
 	sysFd  int
 	closed atomic.Bool
-	isV4   bool
-	l      *slog.Logger
-	batch  int
+	// Held by ListenOut while it runs so Close cannot free the fd under a reader in a callback.
+	reading sync.RWMutex
+	isV4    bool
+	l       *slog.Logger
+	batch   int
 }
 
 func NewListener(l *slog.Logger, ip netip.Addr, port int, multi bool, batch int) (Conn, error) {
@@ -163,6 +166,12 @@ func (u *StdConn) recvmsg(msgs []rawMessage) (int, error) {
 }
 
 func (u *StdConn) ListenOut(r EncReader) error {
+	u.reading.RLock()
+	defer u.reading.RUnlock()
+	if u.closed.Load() {
+		return net.ErrClosed
+	}
+
 	var ip netip.Addr
 	msgs, buffers, names := u.PrepareRawMessages(u.batch)
 	read := u.recvmmsg
@@ -307,6 +316,9 @@ func (u *StdConn) Close() error {
 	// returns ENOTCONN but still wakes it, so ignore the error.
 	// The reader then sees closed and stops touching the fd, making the Close below safe.
 	_ = unix.Shutdown(u.sysFd, unix.SHUT_RDWR)
+	// Wait for the reader to leave ListenOut, its next read must not hit a reused fd number.
+	u.reading.Lock()
+	defer u.reading.Unlock()
 	return unix.Close(u.sysFd)
 }
 
