@@ -3,7 +3,9 @@
 package e2e
 
 import (
+	"bytes"
 	"net/netip"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
@@ -786,6 +788,115 @@ func TestRelayHandshakeOverDisestablishedEntry(t *testing.T) {
 	p = r.RouteForAllUntilTxTun(myControl)
 	assertUdpPacket(t, []byte("Hi from them"), p, theirVpnIpNet[0].Addr(), myVpnIpNet[0].Addr(), 80, 80)
 	r.RenderHostmaps("Final hostmaps", myControl, relayControl, theirControl)
+}
+
+func TestRelayRecoversFromUnansweredForwardedRequest(t *testing.T) {
+	t.Parallel()
+	// me asks the relay for them and the relay's forwarded CreateRelayRequest is lost, leaving the
+	// relay's entry on its tunnel to them in Requested. me's handshake then times out; a pending
+	// hostinfo carries no relay teardown, so me's terminal entry stays Requested and nothing retries
+	// toward them. When them asks the relay for me, the relay forwards it, me answers, and the relay
+	// must answer them too, or the pair stays cut forever while every tunnel to the relay is up.
+	ca, _, caKey, _ := cert_test.NewTestCaCert(cert.Version1, cert.Curve_CURVE25519, time.Now(), time.Now().Add(10*time.Minute), nil, nil, []string{})
+	myControl, myVpnIpNet, myUdpAddr, _ := newSimpleServer(cert.Version1, ca, caKey, "me     ", "10.128.0.1/24", m{"relay": m{"use_relays": true}})
+	relayControl, relayVpnIpNet, relayUdpAddr, _ := newSimpleServer(cert.Version1, ca, caKey, "relay  ", "10.128.0.128/24", m{"relay": m{"am_relay": true}})
+	theirControl, theirVpnIpNet, theirUdpAddr, _ := newSimpleServer(cert.Version1, ca, caKey, "them   ", "10.128.0.2/24", m{"relay": m{"use_relays": true}})
+	myVpnIp, relayVpnIp, theirVpnIp := myVpnIpNet[0].Addr(), relayVpnIpNet[0].Addr(), theirVpnIpNet[0].Addr()
+
+	// me and them reach each other only through the relay
+	myControl.InjectLightHouseAddr(relayVpnIp, relayUdpAddr)
+	myControl.InjectRelays(theirVpnIp, []netip.Addr{relayVpnIp})
+	theirControl.InjectLightHouseAddr(relayVpnIp, relayUdpAddr)
+	theirControl.InjectRelays(myVpnIp, []netip.Addr{relayVpnIp})
+	relayControl.InjectLightHouseAddr(myVpnIp, myUdpAddr)
+	relayControl.InjectLightHouseAddr(theirVpnIp, theirUdpAddr)
+
+	r := router.NewR(t, myControl, relayControl, theirControl)
+	defer r.RenderFlow()
+
+	myControl.Start()
+	relayControl.Start()
+	theirControl.Start()
+
+	r.Log("Bring up both tunnels to the relay")
+	assertTunnel(t, myVpnIp, relayVpnIp, myControl, relayControl, r)
+	assertTunnel(t, theirVpnIp, relayVpnIp, theirControl, relayControl, r)
+
+	byAddr := map[netip.AddrPort]*nebula.Control{myUdpAddr: myControl, relayUdpAddr: relayControl, theirUdpAddr: theirControl}
+	controls := []*nebula.Control{myControl, relayControl, theirControl}
+	h := &header.H{}
+	// route moves packets between the controls until done reports true or the deadline passes, skipping
+	// what drop reports, and counts the test payloads each end receives on its tun.
+	route := func(deadline time.Duration, drop func(from, to *nebula.Control, p *udp.Packet) bool, tick func(), done func() bool) (toMe, toThem int) {
+		cases := make([]reflect.SelectCase, 0, 2*len(controls)+2)
+		owners := make([]*nebula.Control, 0, 2*len(controls))
+		for _, c := range controls {
+			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c.GetUDPTxChan())})
+			owners = append(owners, c)
+			cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(c.GetTunTxChan())})
+			owners = append(owners, c)
+		}
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		timeout := time.NewTimer(deadline)
+		defer timeout.Stop()
+		cases = append(cases,
+			reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ticker.C)},
+			reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(timeout.C)},
+		)
+		for {
+			i, v, _ := reflect.Select(cases)
+			switch {
+			case i == len(cases)-1:
+				return
+			case i == len(cases)-2:
+				if tick != nil {
+					tick()
+				}
+				if done != nil && done() {
+					return
+				}
+			case i%2 == 1:
+				b := v.Bytes()
+				if owners[i] == myControl && bytes.Contains(b, []byte("Hi from them")) {
+					toMe++
+				}
+				if owners[i] == theirControl && bytes.Contains(b, []byte("Hi from me")) {
+					toThem++
+				}
+			default:
+				p := v.Interface().(*udp.Packet)
+				to := byAddr[p.To]
+				if to != nil && !drop(owners[i], to, p) {
+					to.InjectUDPPacket(p)
+				}
+				p.Release()
+			}
+		}
+	}
+
+	r.Log("me asks for a relay to them; the relay's forwarded request to them is lost")
+	myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIp, 80, myVpnIp, 80, []byte("Hi from me")))
+	dropForwarded := func(from, to *nebula.Control, p *udp.Packet) bool {
+		return from == relayControl && to == theirControl && h.Parse(p.Data) == nil && h.Type == header.Control
+	}
+	route(30*time.Second, dropForwarded, nil, func() bool {
+		return myControl.GetHostInfoByVpnAddr(theirVpnIp, true) == nil
+	})
+	require.Nil(t, myControl.GetHostInfoByVpnAddr(theirVpnIp, true), "me's handshake to them should have timed out")
+
+	r.Log("them asks for a relay to me first; me's answer completes me's terminal entry")
+	route(2*time.Second, func(*nebula.Control, *nebula.Control, *udp.Packet) bool { return false }, func() {
+		theirControl.InjectTunPacket(BuildTunUDPPacket(myVpnIp, 80, theirVpnIp, 80, []byte("Hi from them")))
+	}, nil)
+
+	r.Log("Both send through the relay")
+	toMe, toThem := route(10*time.Second, func(*nebula.Control, *nebula.Control, *udp.Packet) bool { return false }, func() {
+		theirControl.InjectTunPacket(BuildTunUDPPacket(myVpnIp, 80, theirVpnIp, 80, []byte("Hi from them")))
+		myControl.InjectTunPacket(BuildTunUDPPacket(theirVpnIp, 80, myVpnIp, 80, []byte("Hi from me")))
+	}, nil)
+	assert.Positive(t, toMe, "no packet from them reached me through the relay")
+	assert.Positive(t, toThem, "no packet from me reached them through the relay")
 }
 
 func TestStage1RaceRelays(t *testing.T) {

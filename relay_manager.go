@@ -598,13 +598,18 @@ func (rm *relayManager) handleCreateRelayRequest(v cert.Version, h *HostInfo, f 
 		}
 
 		// Also track the half-created Relay state just received
-		_, ok = h.relayState.QueryRelayForByIp(target)
-		if !ok {
+		existing, ok := h.relayState.QueryRelayForByIp(target)
+		switch {
+		case !ok:
 			_, err := AddRelay(rm.l, h, f.hostMap, target, &m.InitiatorRelayIndex, ForwardingType, PeerRequested)
 			if err != nil {
 				logMsg.Error("relayManager Failed to allocate a local index for relay", "error", err)
 				return
 			}
+		case existing.State != Established:
+			// The sender is the initiator now. An entry left in Requested by a forwarded request it never
+			// answered would make handleCreateRelayResponse wait on it forever and never answer the sender.
+			h.relayState.PeerRequestRelayByIP(target, m.InitiatorRelayIndex)
 		}
 	}
 }

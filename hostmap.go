@@ -187,6 +187,23 @@ func (rs *RelayState) CompleteRelayByIP(vpnIp netip.Addr, remoteIdx uint32) bool
 	return true
 }
 
+// PeerRequestRelayByIP marks the forwarding entry for vpnIp as requested by that peer and records the
+// peer's index, so the next CreateRelayResponse from the far side is answered toward the peer.
+func (rs *RelayState) PeerRequestRelayByIP(vpnIp netip.Addr, remoteIdx uint32) bool {
+	rs.Lock()
+	defer rs.Unlock()
+	r, ok := rs.relayForByAddr[vpnIp]
+	if !ok {
+		return false
+	}
+	newRelay := *r
+	newRelay.State = PeerRequested
+	newRelay.RemoteIndex = remoteIdx
+	rs.relayForByIdx[r.LocalIndex] = &newRelay
+	rs.relayForByAddr[r.PeerAddr] = &newRelay
+	return true
+}
+
 func (rs *RelayState) CompleteRelayByIdx(localIdx uint32, remoteIdx uint32) (*Relay, bool) {
 	rs.Lock()
 	defer rs.Unlock()
