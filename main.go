@@ -390,6 +390,7 @@ func Main(c *config.C, configTest bool, buildVersion string, l *slog.Logger, dev
 		cancel:                 cancel,
 		sshStart:               sshStart,
 		statsStart:             stats.Start,
+		statsEmitterStart:      stats.startEmitter,
 		dnsStart:               ds.Start,
 		lighthouseStart:        lightHouse.StartUpdateWorker,
 		networkChangeStart:     networkChanges.Start,

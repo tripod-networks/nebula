@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/netip"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -307,4 +308,35 @@ func TestControl_RebindIsGatedByState(t *testing.T) {
 	require.NoError(t, c.Wait())
 	c.RebindUDPServer()
 	assert.Equal(t, 1, conn.rebinds, "rebind after stop must be a no-op")
+}
+
+// The emitter start has to finish before Start returns, so it is called on Start's own goroutine
+func TestControl_StartRunsTheEmitterStartSynchronously(t *testing.T) {
+	c, _, _ := newReadyControl(t)
+	t.Cleanup(c.Stop)
+	callers := make(chan []string, 1)
+	c.statsEmitterStart = func() {
+		pcs := make([]uintptr, 32)
+		frames := runtime.CallersFrames(pcs[:runtime.Callers(1, pcs)])
+		var fns []string
+		for f, more := frames.Next(); ; f, more = frames.Next() {
+			fns = append(fns, f.Function)
+			if !more {
+				break
+			}
+		}
+		callers <- fns
+	}
+
+	require.NoError(t, c.Start())
+	var fns []string
+	waitFor(t, func() bool {
+		select {
+		case fns = <-callers:
+			return true
+		default:
+			return false
+		}
+	})
+	assert.Contains(t, fns, "github.com/slackhq/nebula.(*Control).Start")
 }

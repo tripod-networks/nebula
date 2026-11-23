@@ -53,6 +53,7 @@ type Control struct {
 	cancel                 context.CancelFunc
 	sshStart               func()
 	statsStart             func()
+	statsEmitterStart      func()
 	dnsStart               func()
 	hostDNSStart           func()
 	hostDNSRestore         func()
@@ -102,6 +103,10 @@ func (c *Control) Start() error {
 	// Call all the delayed funcs that waited patiently for the interface to be created.
 	if c.sshStart != nil {
 		go c.sshStart()
+	}
+	if c.statsEmitterStart != nil {
+		// With no exporter, the gauges exist once Start returns
+		c.statsEmitterStart()
 	}
 	if c.statsStart != nil {
 		go c.statsStart()

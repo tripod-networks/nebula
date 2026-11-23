@@ -8,7 +8,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"regexp"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -672,4 +676,213 @@ func TestStatsServer_Start_duringStopWaitsForThePass(t *testing.T) {
 	}
 	waitFor(t, func() bool { return len(entered) == 1 })
 	assert.Equal(t, int64(1), most.Load(), "a Start captured alongside the pass Stop was waiting out")
+}
+
+func newEmitterOnlyServer(t *testing.T, c *config.C, configTest bool, passes *atomic.Int64) *statsServer {
+	t.Helper()
+	var s *statsServer
+	ctx := stopAtCleanup(t, &s)
+	s, err := newStatsServerFromConfig(ctx, slog.New(slog.DiscardHandler), c, "", configTest, func() { passes.Add(1) })
+	require.NoError(t, err)
+	return s
+}
+
+func currentLoopDone(s *statsServer) chan struct{} {
+	s.runMu.Lock()
+	defer s.runMu.Unlock()
+	return s.loopDone
+}
+
+func isClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+// With no exporter the emitter still runs, once before startEmitter returns and then on every tick
+func TestStatsServer_startEmitter_noExporter(t *testing.T) {
+	var passes atomic.Int64
+	c := config.NewC(slog.New(slog.DiscardHandler))
+	setStatsConfig(c, map[string]any{"interval": "20ms"})
+	s := newEmitterOnlyServer(t, c, false, &passes)
+
+	s.startEmitter()
+	assert.Equal(t, int64(1), passes.Load(), "the first emit has to land before startEmitter returns")
+	assert.Nil(t, currentRuntime(s).listener)
+
+	waitFor(t, func() bool { return passes.Load() >= 3 })
+
+	s.Stop()
+	assert.True(t, isClosed(currentLoopDone(s)), "Stop returned with the loop still running")
+	assert.Nil(t, currentRuntime(s))
+}
+
+// An unset stats.interval is not an error with no exporter, the emitter takes the 10s default
+func TestStatsServer_startEmitter_defaultInterval(t *testing.T) {
+	var passes atomic.Int64
+	c := config.NewC(slog.New(slog.DiscardHandler))
+	s := newEmitterOnlyServer(t, c, false, &passes)
+
+	assert.Equal(t, 10*time.Second, s.runCfg.interval)
+	s.startEmitter()
+	assert.Equal(t, int64(1), passes.Load())
+}
+
+// The emitter alone doesn't register the runtime or debug GC sets, those stay with the exporters.
+// Registration is once per process, so the check runs in a child no other test has run in.
+func TestStatsServer_startEmitter_registersNoRuntimeMetrics(t *testing.T) {
+	if os.Getenv("NEBULA_STATS_CHILD") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run", "^"+regexp.QuoteMeta(t.Name())+"$", "-test.v", "-test.count=1", "-test.timeout=60s")
+		cmd.Env = append(os.Environ(), "NEBULA_STATS_CHILD=1")
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(out))
+		require.Contains(t, string(out), "--- PASS: "+t.Name(), "the child ran no such test")
+		return
+	}
+
+	var passes atomic.Int64
+	c := config.NewC(slog.New(slog.DiscardHandler))
+	s := newEmitterOnlyServer(t, c, false, &passes)
+	s.startEmitter()
+
+	require.Equal(t, int64(1), passes.Load())
+	assert.Nil(t, metrics.DefaultRegistry.Get("runtime.MemStats.Alloc"))
+	assert.Nil(t, metrics.DefaultRegistry.Get("debug.GCStats.LastGC"))
+}
+
+// A non-positive or unparseable interval is no error with no exporter, it falls back to 10s
+func TestStatsServer_noExporter_intervalFallback(t *testing.T) {
+	for _, interval := range []string{"0s", "-1s", "not-a-duration"} {
+		t.Run(interval, func(t *testing.T) {
+			c := config.NewC(slog.New(slog.DiscardHandler))
+			setStatsConfig(c, map[string]any{"interval": interval})
+
+			cfg, err := loadStatsConfig(c)
+			require.NoError(t, err)
+			assert.Equal(t, 10*time.Second, cfg.interval)
+		})
+	}
+}
+
+// A Start spawned for an exporter config can run after a reload to no exporter, it builds nothing
+func TestStatsServer_Start_staleForNoExporter(t *testing.T) {
+	var passes atomic.Int64
+	c := config.NewC(slog.New(slog.DiscardHandler))
+	s := newEmitterOnlyServer(t, c, false, &passes)
+	s.enabled.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		s.Start()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start built a runtime for a config with no exporter")
+	}
+	assert.Nil(t, currentRuntime(s))
+
+	s.enabled.Store(false)
+	s.startEmitter()
+	assert.Equal(t, int64(1), passes.Load())
+	assert.NotNil(t, currentRuntime(s))
+}
+
+// The first emit holds the runtime slot, so a caller that finds it taken returns after the emit
+func TestStatsServer_startEmitter_firstEmitHoldsTheSlot(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	c := config.NewC(slog.New(slog.DiscardHandler))
+	var s *statsServer
+	ctx := stopAtCleanup(t, &s)
+	s, err := newStatsServerFromConfig(ctx, slog.New(slog.DiscardHandler), c, "", false, func() {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+	})
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		s.startEmitter()
+		close(done)
+	}()
+	<-entered
+	if s.runMu.TryLock() {
+		s.runMu.Unlock()
+		t.Error("the first emit ran after the runtime slot was released")
+	}
+	close(release)
+	<-done
+}
+
+// A config test builds the stats server and nothing runs
+func TestStatsServer_startEmitter_configTest(t *testing.T) {
+	var passes atomic.Int64
+	c := config.NewC(slog.New(slog.DiscardHandler))
+	setStatsConfig(c, map[string]any{"interval": "20ms"})
+	s := newEmitterOnlyServer(t, c, true, &passes)
+
+	s.startEmitter()
+	s.Start()
+	assert.Equal(t, int64(0), passes.Load())
+	assert.Nil(t, currentRuntime(s))
+	assert.Nil(t, currentLoopDone(s))
+}
+
+// A reload that changes only the interval moves the loop to it, the 1h loop would never tick
+func TestStatsServer_startEmitter_reloadMovesTheInterval(t *testing.T) {
+	var passes atomic.Int64
+	c := config.NewC(slog.New(slog.DiscardHandler))
+	setStatsConfig(c, map[string]any{"interval": "1h"})
+	s := newEmitterOnlyServer(t, c, false, &passes)
+	s.startEmitter()
+	first := currentLoopDone(s)
+
+	setStatsConfig(c, map[string]any{"interval": "20ms"})
+	require.NoError(t, s.reload(c, false))
+	assert.True(t, isClosed(first), "the old loop outlived the reload")
+	waitFor(t, func() bool { return passes.Load() >= 4 })
+}
+
+// Selecting an exporter hands the emitter over and deselecting takes it back, one loop at a time
+func TestStatsServer_startEmitter_reloadSwapsLoops(t *testing.T) {
+	var passes atomic.Int64
+	port := freeTCPPort(t)
+	c := config.NewC(slog.New(slog.DiscardHandler))
+	setStatsConfig(c, map[string]any{"interval": "1h"})
+	s := newEmitterOnlyServer(t, c, false, &passes)
+
+	s.startEmitter()
+	require.Equal(t, int64(1), passes.Load())
+	idle := currentLoopDone(s)
+
+	setStatsConfig(c, map[string]any{
+		"type":     "prometheus",
+		"interval": "1h",
+		"listen":   "127.0.0.1:" + port,
+		"path":     "/metrics",
+	})
+	require.NoError(t, s.reload(c, false))
+	assert.True(t, isClosed(idle), "the no-exporter loop outlived the reload")
+	waitForListening(t, "127.0.0.1:"+port)
+	assert.Equal(t, int64(2), passes.Load(), "the exporter runtime primes once")
+	exporter := currentLoopDone(s)
+	assert.NotEqual(t, idle, exporter)
+	assert.False(t, isClosed(exporter))
+
+	setStatsConfig(c, map[string]any{"interval": "1h"})
+	require.NoError(t, s.reload(c, false))
+	assert.True(t, isClosed(exporter), "the exporter loop outlived the reload")
+	assert.Equal(t, int64(3), passes.Load(), "the no-exporter loop primes once before reload returns")
+	back := currentLoopDone(s)
+	assert.NotEqual(t, exporter, back)
+	assert.False(t, isClosed(back))
+	assert.NotNil(t, currentRuntime(s))
 }

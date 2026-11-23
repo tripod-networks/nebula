@@ -45,13 +45,13 @@ type statsServer struct {
 	emitStats func()
 }
 
-// statsRuntime is the live state owned by a single Start invocation. Start
+// statsRuntime is the live state owned by a single Start or startEmitter invocation. Start
 // stashes a pointer under runMu; Stop and Start's own exit path use pointer
 // equality to tell "my runtime" apart from one that replaced it after a
 // reload.
 type statsRuntime struct {
 	cancel   context.CancelFunc
-	listener *http.Server // nil for graphite
+	listener *http.Server // nil for graphite and the emitter alone
 }
 
 // statsConfig is the snapshot of stats-related config that drives the runtime.
@@ -113,19 +113,20 @@ func newStatsServerFromConfig(ctx context.Context, l *slog.Logger, c *config.C, 
 }
 
 // reload records the latest config. On the initial call it only records it;
-// Control.Start is what launches the first runtime via statsStart. On later
-// calls it reconciles the running runtime with the new config:
+// Control.Start is what launches the first runtime via statsStart, or via statsEmitterStart with
+// no exporter. On later calls it reconciles the running runtime with the new config:
 //
 //   - newly enabled -> spawn Start
-//   - newly disabled -> Stop the runtime
+//   - newly disabled -> Stop the runtime, then run the emitter alone
 //   - config changed (still enabled) -> Stop the old, Start the new
+//   - emitter loop (no exporter) -> stopped by enabling one, restarted by an interval change
 //   - no change -> no-op
 func (s *statsServer) reload(c *config.C, initial bool) error {
 	newCfg, err := loadStatsConfig(c)
 	if err != nil {
 		return err
 	}
-	enabled := newCfg.typ != "" && newCfg.typ != "none"
+	enabled := newCfg.exporter()
 
 	s.runMu.Lock()
 	sameCfg := s.runCfg != nil && *s.runCfg == newCfg
@@ -143,6 +144,7 @@ func (s *statsServer) reload(c *config.C, initial bool) error {
 	if enabled && !s.configTest {
 		go s.Start()
 	}
+	s.startEmitter()
 	return nil
 }
 
@@ -156,7 +158,7 @@ func (s *statsServer) Start() {
 	}
 
 	s.runMu.Lock()
-	if s.ctx.Err() != nil || s.run != nil || s.runCfg == nil {
+	if s.ctx.Err() != nil || s.run != nil || s.runCfg == nil || !s.runCfg.exporter() {
 		s.runMu.Unlock()
 		return
 	}
@@ -197,6 +199,30 @@ func (s *statsServer) Start() {
 			s.runCfg = nil
 		}
 	}
+	s.runMu.Unlock()
+}
+
+// startEmitter runs the emitter alone: once before it returns, then on every tick. No-op with an
+// exporter, a running loop or a config test.
+func (s *statsServer) startEmitter() {
+	if s.configTest || s.emitStats == nil {
+		return
+	}
+
+	s.runMu.Lock()
+	if s.ctx.Err() != nil || s.run != nil || s.runCfg == nil || s.runCfg.exporter() {
+		s.runMu.Unlock()
+		return
+	}
+	interval := s.runCfg.interval
+	runCtx, cancel := context.WithCancel(s.ctx)
+	s.run = &statsRuntime{cancel: cancel}
+	done := make(chan struct{})
+	s.loopDone = done
+
+	// Under runMu so a caller that finds the slot taken returns after this emit is done
+	s.emitStats()
+	go captureStatsLoop(runCtx, interval, []func(){s.emitStats}, done)
 	s.runMu.Unlock()
 }
 
@@ -350,11 +376,21 @@ func captureStatsLoop(ctx context.Context, d time.Duration, fns []func(), done c
 	}
 }
 
+// exporter reports whether the config selects prometheus, graphite or an unknown type to reject.
+func (cfg statsConfig) exporter() bool {
+	return cfg.typ != "" && cfg.typ != "none"
+}
+
 func loadStatsConfig(c *config.C) (statsConfig, error) {
 	cfg := statsConfig{
 		typ: c.GetString("stats.type", ""),
 	}
-	if cfg.typ == "" || cfg.typ == "none" {
+	if !cfg.exporter() {
+		// The emitter alone ticks at the interval when it is valid, else at the v1.11 default
+		cfg.interval = c.GetDuration("stats.interval", 10*time.Second)
+		if cfg.interval <= 0 {
+			cfg.interval = 10 * time.Second
+		}
 		return cfg, nil
 	}
 
